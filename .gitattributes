@@ -1,0 +1,4 @@
+# Everything is LF. Mixed line endings break shell scripts inside containers
+# and make diffs unreadable.
+* text=auto eol=lf
+*.png binary

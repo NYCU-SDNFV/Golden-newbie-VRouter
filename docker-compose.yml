@@ -1,0 +1,14 @@
+services:
+  lab3:
+    build: .
+    container_name: lab3
+    privileged: true
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - ./:/workspace
+    working_dir: /workspace
+    tty: true
+    stdin_open: true

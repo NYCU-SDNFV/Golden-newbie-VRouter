@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+*.pem
+id_rsa
+*.solution.*
+LAB*-SOLUTION.md
+results/
+captures/
+build/
+.key-tree/
+.student-tree/
+result.json
+release-body.md
+local-provenance.json
+poc-outcomes.json
