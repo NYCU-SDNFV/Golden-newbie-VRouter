@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "name": "VRouter",
+  "lab": 3,
+  "assignment": "lab3-vrouter",
+  "checks": 20,
+  "environment": "vrouter"
+}

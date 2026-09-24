@@ -6,10 +6,11 @@ GROUPS := a1 a2 a3 b0 b1 b2 b3 b4 b5 b6 b7 b8 b9 b10
 export CONTAINER
 .NOTPARALLEL:
 
-.PHONY: help build up down deploy status shell logs clean policy test test-offline check-update update a b report git $(GROUPS)
+.PHONY: help pretest build up down deploy status shell logs clean policy test test-offline check-update update a b report git $(GROUPS)
 
 help:
 	@printf '%s\n' \
+	  'make pretest                  Diagnose the Docker engine host (non-scoring)' \
 	  'make up                       Start the supplied course container' \
 	  'make deploy PLANE=frr|ovs      Deploy the Part A or Part B topology' \
 	  'make a / make b                Run Part A / Part B checks' \
@@ -17,6 +18,9 @@ help:
 	  'make test-offline              Run all checks without an online version check' \
 	  'make status / make shell       Inspect the running lab' \
 	  'make clean                    Remove only this lab container and topology'
+
+pretest:
+	@python3 -B .github/golden/pretest.py
 
 build:
 	$(COMPOSE) build

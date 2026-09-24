@@ -1,9 +1,9 @@
 {
   "schema": 1,
   "channel": "newbie",
-  "version": "0.1.1",
-  "tag": "newbie-v0.1.1",
+  "version": "0.1.2",
+  "tag": "newbie-v0.1.2",
   "template": "NYCU-SDNFV/Golden-newbie-VRouter",
-  "source_sha": "dabf75faa1e2cf5436f00f04bf29f8d5dafd83b7",
-  "minimum_version": "0.1.1"
+  "source_sha": "3e3c058962dc837187c544b8a60973d5bc02169c",
+  "minimum_version": "0.1.2"
 }

@@ -65,13 +65,21 @@ Git Bash (which rewrites Docker paths). Full Lab 3 validation is performed on
 the course Linux/PVE environment; macOS and other Docker kernels are not
 implicitly certified.
 
-The supplied image is `ghcr.io/nycu-sdnfv/lab-base:115-1`. It contains FRR, OVS,
+Run the non-scoring `make pretest` before starting. If it reports a
+host prerequisite, follow the [course environment preparation guide](.github/golden/README.md)
+on the machine that actually runs the Docker Engine. The pretest uses isolated
+privileged probes and does not change host sysctl policy or your answers.
+Probes can trigger normal Linux module autoload; use an authorized dedicated lab
+VM, not a shared production Docker host.
+
+The supplied image is pinned to an immutable course image in `Dockerfile`. It contains FRR, OVS,
 namespace tools, `tcpdump`, `ethtool`, `ping` and `iperf3`. Do not install another
 controller framework or change protected infrastructure to make a test pass.
 The container is privileged because it creates isolated networking resources;
 only use it on an authorized lab machine.
 
 ```sh
+make pretest
 make up
 sh tests/00_env.sh
 make deploy PLANE=frr

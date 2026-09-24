@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "toolkit_ref": "f89d46496fe9ff7f1a0479e6f1838aa6aedac829",
+  "files": {
+    ".github/golden/README.md": "7a0545b472535b025690b91cbe3bbaf27ba88d96da958d874e1c3a97aaeba232",
+    ".github/golden/__init__.py": "d8cf9b214c218e8d6d036bf9f436995cffad6820ba030fe755ee52fa9541ebbd",
+    ".github/golden/contract.py": "d3658a9bdba77f9c2db17a94ff76364da654147d2fdb3ad48964d74648577d24",
+    ".github/golden/environment.py": "1bfbf561209ff535af43949a156ba9a3b45a7c4423a7b81cb7fe2f4eee79300d",
+    ".github/golden/grading.py": "abbd2ca775caf94751bf0350fcc980af866788135e088bbff7f22eff0f6f260d",
+    ".github/golden/pretest.py": "8d1618dde41ce67f655ca4a8c094fa8da80a60c87a1b221482a7a7562fa3c35d",
+    ".github/golden/probe.py": "0baf85fdd22ef964779f0ca98538e18481d03b0e95f0d241d9a482d98742d7b4",
+    ".github/grade/autograder.py": "264962a84a10827a9a3610073ae873134b1905a274b1928fe89a78133e918811"
+  }
+}
