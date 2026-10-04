@@ -7,11 +7,21 @@ import shutil
 import signal
 import subprocess
 import time
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Literal, TypeVar, cast
 
 from harness import oracle, routing
+from harness.contracts import (
+    BGPObservations, BGPSummary, CleanResult, CleanupState, ControllerState,
+    DeployedStatus, JSONValue, KernelRoute, PipelineTrace, ProcessHealth,
+    ProcessStatus, RuntimeState, RuntimeStatus,
+)
 from topo import lab3_topo
+from topo.model import TopologyState, port_number
+
+T = TypeVar("T")
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE_DIR = Path("/run/lab3")
@@ -26,16 +36,17 @@ class RuntimeFailure(RuntimeError):
     pass
 
 
-def atomic_json(path, value):
+def atomic_json(path: str | Path, value: object) -> None:
     lab3_topo.atomic_json(path, value)
 
 
-def load_json(path):
+def load_json(path: str | Path) -> JSONValue:
+    """Decode JSON without schema conversion; callers name the writer's contract."""
     with Path(path).open(encoding="ascii") as stream:
         return json.load(stream)
 
 
-def prepare_evidence_directories():
+def prepare_evidence_directories() -> None:
     owner = ROOT.stat()
     for directory in (RESULTS, CAPTURES):
         if directory.is_symlink():
@@ -50,7 +61,7 @@ def prepare_evidence_directories():
 
 
 @contextmanager
-def lifecycle_lock(timeout=10):
+def lifecycle_lock(timeout: float = 10) -> Iterator[None]:
     import fcntl
 
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -72,7 +83,7 @@ def lifecycle_lock(timeout=10):
         stream.close()
 
 
-def _verify_osken_runtime():
+def _verify_osken_runtime() -> None:
     try:
         from os_ken.ofproto import ofproto_v1_3, ofproto_v1_3_parser
     except ImportError as exc:
@@ -83,7 +94,7 @@ def _verify_osken_runtime():
         raise RuntimeFailure("installed os-ken lacks OFPActionDecNwTtl")
 
 
-def _validate_implementation(plane):
+def _validate_implementation(plane: str) -> None:
     for as_number in range(1, 5):
         try:
             config = routing.build_frr_config(as_number)
@@ -96,17 +107,19 @@ def _validate_implementation(plane):
                 "BGP configuration for AS%d lacks required dual-stack sections" % as_number)
     if plane == "frr":
         return
-    probes = (
+    # Student implementations may return anything, including malformed records.
+    probes: tuple[tuple[str, Callable[[], object], Callable[[object], object]], ...] = (
         ("FIB JSON parser", lambda: routing.parse_fib("[]"),
          lambda value: isinstance(value, list)),
         ("route replacement", lambda: routing.RouteTable().replace([]),
-         lambda value: isinstance(value, tuple) and len(value) == 2),
+         lambda value: isinstance(value, tuple) and len(cast(tuple[object, ...], value)) == 2),
         ("neighbor parser", lambda: routing.parse_neighbors("[]"),
          lambda value: isinstance(value, dict)),
         ("forwarding actions", lambda: routing.forwarding_actions(
             routing.Route(4, "192.0.2.0/24", "", "test0", "test"),
             "02:00:00:00:00:01", "02:00:00:00:00:02", 1),
-         lambda value: isinstance(value, dict) and value.get("decrement_ttl")),
+         lambda value: isinstance(value, dict) and
+         cast(dict[object, object], value).get("decrement_ttl")),
         ("next-hop resolution", lambda: routing.resolve_next_hop(
             routing.Route(4, "192.0.2.0/24", "", "test0", "test"), {},
             {"test0": {"ofport": 1, "destination_mac": "02:00:00:00:00:02"}}),
@@ -132,7 +145,7 @@ def _validate_implementation(plane):
                              ", ".join(missing))
 
 
-def _requirements(plane):
+def _requirements(plane: str) -> None:
     required = ["ip", "ovs-vsctl", "ovs-ofctl", "vtysh", "tcpdump", "ping",
                 "ethtool"]
     if plane == "ovs":
@@ -150,7 +163,7 @@ def _requirements(plane):
         _verify_osken_runtime()
 
 
-def _pid_from(path):
+def _pid_from(path: str | Path) -> int:
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
         try:
@@ -160,7 +173,7 @@ def _pid_from(path):
     raise RuntimeFailure("daemon did not create PID file %s" % path)
 
 
-def process_command(pid):
+def process_command(pid: int) -> str:
     try:
         return Path("/proc/%d/cmdline" % pid).read_bytes().replace(b"\x00", b" ").decode(
             "utf-8", "replace")
@@ -168,7 +181,7 @@ def process_command(pid):
         return ""
 
 
-def owned_process_status(pid, tokens):
+def owned_process_status(pid: int, tokens: Sequence[str]) -> ProcessStatus:
     command = process_command(pid)
     if not command:
         return {"running": False, "owned": False, "command": ""}
@@ -181,7 +194,7 @@ def owned_process_status(pid, tokens):
     return {"running": state not in ("Z", "X"), "owned": owned, "command": command}
 
 
-def controller_state_fresh(value, now=None):
+def controller_state_fresh(value: ControllerState, now: float | None = None) -> bool | None:
     now = time.time() if now is None else now
     age = now - float(value.get("updated", 0))
     return (
@@ -190,8 +203,8 @@ def controller_state_fresh(value, now=None):
         set(value.get("datapaths", [])) == {1, 2, 3, 4})
 
 
-def controller_connections(topology):
-    result = {}
+def controller_connections(topology: TopologyState) -> dict[str, bool]:
+    result: dict[str, bool] = {}
     for entry in topology["ases"].values():
         bridge = entry["bridge"]
         record = lab3_topo.run(
@@ -209,7 +222,7 @@ def controller_connections(topology):
     return result
 
 
-def _require_owned(pid, tokens):
+def _require_owned(pid: int, tokens: Sequence[str]) -> bool:
     process = owned_process_status(pid, tokens)
     if not process["running"]:
         return False
@@ -219,7 +232,7 @@ def _require_owned(pid, tokens):
     return True
 
 
-def stop_owned(pid, tokens, timeout=4):
+def stop_owned(pid: int, tokens: Sequence[str], timeout: float = 4) -> None:
     if not _require_owned(pid, tokens):
         return
     os.kill(pid, signal.SIGTERM)
@@ -232,7 +245,7 @@ def stop_owned(pid, tokens, timeout=4):
         os.kill(pid, signal.SIGKILL)
 
 
-def _prepare_frr_dir(pathspace):
+def _prepare_frr_dir(pathspace: str) -> tuple[int, int]:
     import grp
     import pwd
 
@@ -247,7 +260,7 @@ def _prepare_frr_dir(pathspace):
     return uid, gid
 
 
-def _start_frr(as_number, state):
+def _start_frr(as_number: int, state: RuntimeState) -> dict[str, int]:
     namespace = "l3-r%d" % as_number
     pathspace = "lab3-r%d" % as_number
     directory = STATE_DIR / "frr" / ("r%d" % as_number)
@@ -265,7 +278,7 @@ def _start_frr(as_number, state):
     config_path = directory / "frr.conf"
     config_path.write_text(config, encoding="ascii", newline="\n")
     os.chmod(str(config_path), 0o644)
-    pids = {}
+    pids: dict[str, int] = {}
     for daemon in ("zebra", "bgpd"):
         pidfile = Path("/run/frr") / pathspace / (daemon + ".pid")
         command = [
@@ -289,7 +302,8 @@ def _start_frr(as_number, state):
     return pids
 
 
-def vtysh(as_number, commands, check=True):
+def vtysh(as_number: int, commands: str | Sequence[str],
+          check: bool = True) -> subprocess.CompletedProcess[str]:
     if isinstance(commands, str):
         commands = [commands]
     argv = ["ip", "netns", "exec", "l3-r%d" % as_number,
@@ -304,7 +318,7 @@ def vtysh(as_number, commands, check=True):
     return proc
 
 
-def _established_count(value):
+def _established_count(value: JSONValue) -> int:
     count = 0
     if isinstance(value, dict):
         state = value.get("state") or value.get("peerState")
@@ -318,18 +332,20 @@ def _established_count(value):
     return count
 
 
-def bgp_summary(as_number, family):
+def bgp_summary(as_number: int, family: int) -> BGPSummary:
     afi = "ipv4" if family == 4 else "ipv6"
     proc = vtysh(as_number, "show bgp %s unicast summary json" % afi)
     try:
-        value = json.loads(proc.stdout)
+        value: JSONValue = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeFailure("FRR AS%d returned invalid %s summary JSON: %s" %
                              (as_number, afi, proc.stdout[:200])) from exc
     return {"established": _established_count(value), "raw": value}
 
 
-def wait_for(description, predicate, timeout=30, interval=0.25):
+def wait_for(description: str, predicate: Callable[[], T | Literal[False] | None],
+             timeout: float = 30, interval: float = 0.25) -> T:
+    """Return the predicate's truthy value, or raise with the last observation."""
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
@@ -344,7 +360,7 @@ def wait_for(description, predicate, timeout=30, interval=0.25):
     raise RuntimeFailure("timed out waiting for %s (last=%r)" % (description, last))
 
 
-def _wait_bgp():
+def _wait_bgp() -> BGPObservations:
     expected = {1: 2, 2: 2, 3: 2}
     expected_prefixes = {
         1: {"10.2.0.0/24", "10.3.0.0/24",
@@ -355,15 +371,15 @@ def _wait_bgp():
             "2001:db8:1::/64", "2001:db8:2::/64"},
     }
 
-    def ready():
-        observations = {}
+    def ready() -> BGPObservations | Literal[False]:
+        observations: BGPObservations = {}
         for asn, peers in expected.items():
             for family in (4, 6):
                 count = bgp_summary(asn, family)["established"]
                 observations[(asn, family)] = count
                 if count < peers:
                     return False
-            installed = set()
+            installed: set[str] = set()
             for family, flag in ((4, "-4"), (6, "-6")):
                 output = lab3_topo.ns_exec(
                     "l3-r%d" % asn, "ip", "-j", flag, "route", "show",
@@ -379,7 +395,8 @@ def _wait_bgp():
                     output = lab3_topo.ns_exec(
                         "l3-r1", "ip", "-j", flag, "route", "get",
                         destination).stdout
-                    route = json.loads(output)[0]
+                    rows: list[KernelRoute] = json.loads(output)
+                    route = rows[0]
                     observations[(asn, destination)] = route.get("dev")
                     if route.get("dev") != "r1-12":
                         return False
@@ -388,14 +405,17 @@ def _wait_bgp():
     return wait_for("three-AS dual-stack BGP routes", ready, timeout=35, interval=0.5)
 
 
-def _start_controller(state, topology):
+def _start_controller(state: RuntimeState, topology: TopologyState) -> ControllerState:
+    executable = shutil.which("osken-manager")
+    if executable is None:
+        raise RuntimeFailure("osken-manager disappeared after the requirements check")
     log_path = RESULTS / "controller.log"
     log_stream = log_path.open("ab", buffering=0)
     env = dict(os.environ)
     env["LAB3_STATE_DIR"] = str(STATE_DIR)
     env["PYTHONPATH"] = str(ROOT) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     command = [
-        shutil.which("osken-manager"), "--ofp-tcp-listen-port", "6653",
+        executable, "--ofp-tcp-listen-port", "6653",
         str(ROOT / "harness" / "controller.py"),
     ]
     process = subprocess.Popen(
@@ -414,15 +434,16 @@ def _start_controller(state, topology):
             "tcp:127.0.0.1:6653",
         ])
 
-    def ready():
+    def ready() -> ControllerState | Literal[False]:
         if process.poll() is not None:
             raise RuntimeFailure("controller exited; inspect %s" % log_path)
         try:
-            status = load_json(STATE_DIR / "controller.json")
+            status = cast(ControllerState, load_json(STATE_DIR / "controller.json"))
         except FileNotFoundError:
             return False
-        if status.get("last_error"):
-            raise RuntimeFailure(status["last_error"])
+        error = status.get("last_error")
+        if error:
+            raise RuntimeFailure(error)
         routes = status.get("routes", {}).get("1", [])
         prefixes = {route["prefix"] for route in routes}
         return status if status.get("ready") and {
@@ -432,23 +453,23 @@ def _start_controller(state, topology):
     return wait_for("OVS controller and initial FIB import", ready, timeout=25)
 
 
-def _verify_invalid_ttl_pipeline(topology):
+def _verify_invalid_ttl_pipeline(topology: TopologyState) -> dict[str, PipelineTrace]:
     entry = topology["ases"]["1"]
     host = entry["hosts"][0]
     fields = {
         "ipv4": (
             "in_port=%d,dl_src=%s,dl_dst=%s,dl_type=0x0800,"
             "nw_src=10.1.0.10,nw_dst=10.3.0.10,nw_proto=1,nw_ttl=1,icmp_type=8,icmp_code=0" %
-            (host["ofport"], host["mac"], entry["gw_mac"])),
+            (port_number(host), host["mac"], entry["gw_mac"])),
         "ipv6": (
             "in_port=%d,dl_src=%s,dl_dst=%s,dl_type=0x86dd,"
             "ipv6_src=2001:db8:1::10,ipv6_dst=2001:db8:3::10,"
             "nw_proto=58,nw_ttl=1,icmpv6_type=128,icmpv6_code=0" %
-            (host["ofport"], host["mac"], entry["gw_mac"])),
+            (port_number(host), host["mac"], entry["gw_mac"])),
     }
 
-    def trace_ready():
-        traces = {}
+    def trace_ready() -> dict[str, PipelineTrace] | Literal[False]:
+        traces: dict[str, PipelineTrace] = {}
         for family, flow in fields.items():
             result = lab3_topo.run(
                 ["ovs-appctl", "ofproto/trace", entry["bridge"], flow],
@@ -472,11 +493,11 @@ def _verify_invalid_ttl_pipeline(topology):
     return traces
 
 
-def status():
+def status() -> RuntimeStatus:
     if not RUNTIME_FILE.is_file():
         return {"deployed": False, "state_dir": str(STATE_DIR)}
-    state = load_json(RUNTIME_FILE)
-    processes = []
+    state = cast(RuntimeState, load_json(RUNTIME_FILE))
+    processes: list[ProcessHealth] = []
     for item in state.get("frr", []):
         process = owned_process_status(
             item["pid"], [item["daemon"], item["pathspace"]])
@@ -493,7 +514,7 @@ def status():
             "role": "controller", "pid": controller["pid"],
             "running": process["running"], "owned": process["owned"],
         })
-    value = {
+    value: DeployedStatus = {
         "deployed": True, "plane": state["plane"], "scenario": state["scenario"],
         "started": state["started"], "processes": processes,
         "healthy": (
@@ -505,7 +526,7 @@ def status():
         "state_dir": str(STATE_DIR),
     }
     if (STATE_DIR / "controller.json").is_file():
-        value["controller"] = load_json(STATE_DIR / "controller.json")
+        value["controller"] = cast(ControllerState, load_json(STATE_DIR / "controller.json"))
         age = time.time() - float(value["controller"].get("updated", 0))
         value["controller"]["age_seconds"] = age
         controller_fresh = controller_state_fresh(value["controller"])
@@ -514,23 +535,23 @@ def status():
         value["healthy"] = False
     if state["plane"] == "ovs" and TOPOLOGY_FILE.is_file():
         value["controller_connections"] = controller_connections(
-            load_json(TOPOLOGY_FILE))
+            cast(TopologyState, load_json(TOPOLOGY_FILE)))
         value["healthy"] = value["healthy"] and all(
             value["controller_connections"].values())
     return value
 
 
-def _deploy_unlocked(plane):
+def _deploy_unlocked(plane: str) -> DeployedStatus:
     _requirements(plane)
     _validate_implementation(plane)
     prepare_evidence_directories()
     if RUNTIME_FILE.is_file():
         existing = status()
-        if existing.get("plane") == plane and existing.get("healthy"):
+        if existing["deployed"] is True and existing["plane"] == plane and existing["healthy"]:
             return existing
         _clean_unlocked()
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    state = {
+    state: RuntimeState = {
         "version": 1, "plane": plane, "started": time.time(),
         "scenario": "default", "frr": [], "controller": None,
     }
@@ -549,9 +570,9 @@ def _deploy_unlocked(plane):
         state["ready"] = time.time()
         atomic_json(RUNTIME_FILE, state)
 
-        def healthy():
+        def healthy() -> DeployedStatus | Literal[False]:
             observed = status()
-            return observed if observed.get("healthy") else False
+            return observed if observed["deployed"] is True and observed["healthy"] else False
 
         return wait_for("healthy deployment and live controller connections",
                         healthy, timeout=10, interval=0.1)
@@ -567,14 +588,14 @@ def _deploy_unlocked(plane):
         raise
 
 
-def deploy(plane):
+def deploy(plane: str) -> DeployedStatus:
     with lifecycle_lock():
         return _deploy_unlocked(plane)
 
 
-def _clean_unlocked():
-    errors = []
-    state = load_json(RUNTIME_FILE) if RUNTIME_FILE.is_file() else {}
+def _clean_unlocked() -> CleanResult:
+    errors: list[str] = []
+    state = cast(CleanupState, load_json(RUNTIME_FILE)) if RUNTIME_FILE.is_file() else CleanupState()
     allowed_pathspaces = {"lab3-r%d" % asn for asn in range(1, 5)}
     for item in state.get("frr", []):
         if item.get("pathspace") not in allowed_pathspaces:
@@ -595,7 +616,7 @@ def _clean_unlocked():
         except (RuntimeFailure, OSError) as exc:
             errors.append(str(exc))
     if TOPOLOGY_FILE.is_file():
-        topology = load_json(TOPOLOGY_FILE)
+        topology = cast(TopologyState, load_json(TOPOLOGY_FILE))
         try:
             lab3_topo.remove(topology)
         except lab3_topo.CommandError as exc:
@@ -611,22 +632,22 @@ def _clean_unlocked():
     return {"cleaned": True}
 
 
-def clean():
+def clean() -> CleanResult:
     with lifecycle_lock():
         return _clean_unlocked()
 
 
-def update_state_scenario(name):
-    state = load_json(RUNTIME_FILE)
+def update_state_scenario(name: str) -> None:
+    state = cast(RuntimeState, load_json(RUNTIME_FILE))
     state["scenario"] = name
     atomic_json(RUNTIME_FILE, state)
 
 
-def _scenario_unlocked(name):
+def _scenario_unlocked(name: str) -> RuntimeStatus:
     if not RUNTIME_FILE.is_file():
         raise RuntimeFailure("Lab 3 is not deployed")
-    state = load_json(RUNTIME_FILE)
-    topology = load_json(TOPOLOGY_FILE)
+    state = cast(RuntimeState, load_json(RUNTIME_FILE))
+    topology = cast(TopologyState, load_json(TOPOLOGY_FILE))
     if name == "link-down":
         lab3_topo.set_link(topology, "12", False)
     elif name == "link-up":
@@ -671,6 +692,6 @@ def _scenario_unlocked(name):
     return status()
 
 
-def scenario(name):
+def scenario(name: str) -> RuntimeStatus:
     with lifecycle_lock():
         return _scenario_unlocked(name)

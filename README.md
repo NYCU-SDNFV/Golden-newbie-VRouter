@@ -107,6 +107,23 @@ codec; the routing and controller behavior are your implementation. Only change 
 your report/disclosure. A file in the integrity manifest is given infrastructure,
 not an exercise. The official grader runs a fresh canonical copy of the checks.
 
+### Reading types in the student code
+
+The generated starter retains parameter/return annotations on the exercises,
+including the separate unfinished controller constructor. Editor hover exposes
+`Route | None`, `(changed, withdrawn)` route lists, the forwarding-plan fields,
+and kernel/topology records. Missing packet replies are `bytes | None`, not an
+empty successful packet. Ports in an in-progress topology may not have an
+`ofport` yet; [topo/model.py](topo/model.py) describes that distinction.
+
+[pyrightconfig.json](pyrightconfig.json) targets the course's Python 3.12/Linux
+runtime. The [inspected os-ken subset](typings/README.md) supplies editor types
+for OpenFlow 1.3 without installing Mininet or another controller framework.
+These are declarations, not executable replacements for os-ken. A local editor
+without os-ken may report that its runtime source is missing; use the course
+container for execution. Type correctness does not complete a TODO or establish
+BGP/forwarding correctness.
+
 ## 3. Experiments and evidence
 
 Checks execute fresh probes rather than trusting a success JSON committed by a

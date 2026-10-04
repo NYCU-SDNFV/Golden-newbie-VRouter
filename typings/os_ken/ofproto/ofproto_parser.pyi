@@ -1,0 +1,13 @@
+from harness.openflow import Datapath13
+
+class MsgBase:
+    datapath: Datapath13
+    version: int | None
+    msg_type: int | None
+    msg_len: int | None
+    xid: int | None
+    buf: bytes | bytearray | None
+    def __init__(self, datapath: Datapath13) -> None: ...
+    def set_xid(self, xid: int) -> None: ...
+    def set_buf(self, buf: bytes | bytearray) -> None: ...
+    def serialize(self) -> None: ...

@@ -7,9 +7,14 @@ import json
 import os
 import re
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Literal, overload
 
-from topo.model import AS, LINKS, VXLAN, bare, links_for, speaker_mac
+from topo.model import (
+    AS, LINKS, VXLAN, ASState, TopologyResources, TopologyState,
+    bare, links_for, port_number, speaker_mac,
+)
 
 STATE_DIR = Path("/run/lab3")
 
@@ -18,7 +23,23 @@ class CommandError(RuntimeError):
     pass
 
 
-def run(argv, timeout=15, check=True, capture=True):
+@overload
+def run(argv: Sequence[str], timeout: float = 15, check: bool = True, *,
+        capture: Literal[True] = True) -> subprocess.CompletedProcess[str]: ...
+
+
+@overload
+def run(argv: Sequence[str], timeout: float = 15, check: bool = True, *,
+        capture: Literal[False]) -> subprocess.CompletedProcess[None]: ...
+
+
+@overload
+def run(argv: Sequence[str], timeout: float = 15, check: bool = True,
+        capture: bool = True) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[None]: ...
+
+
+def run(argv: Sequence[str], timeout: float = 15, check: bool = True,
+        capture: bool = True) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[None]:
     try:
         proc = subprocess.run(
             argv, text=True, timeout=timeout, check=False,
@@ -33,11 +54,28 @@ def run(argv, timeout=15, check=True, capture=True):
     return proc
 
 
-def ns_exec(namespace, *argv, **kwargs):
-    return run(["ip", "netns", "exec", namespace] + list(argv), **kwargs)
+@overload
+def ns_exec(namespace: str, *argv: str, timeout: float = 15,
+            check: bool = True, capture: Literal[True] = True) -> subprocess.CompletedProcess[str]: ...
 
 
-def atomic_json(path, value):
+@overload
+def ns_exec(namespace: str, *argv: str, timeout: float = 15,
+            check: bool = True, capture: Literal[False]) -> subprocess.CompletedProcess[None]: ...
+
+
+@overload
+def ns_exec(namespace: str, *argv: str, timeout: float = 15,
+            check: bool = True, capture: bool = True) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[None]: ...
+
+
+def ns_exec(namespace: str, *argv: str, timeout: float = 15,
+            check: bool = True, capture: bool = True) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[None]:
+    return run(["ip", "netns", "exec", namespace] + list(argv),
+               timeout=timeout, check=check, capture=capture)
+
+
+def atomic_json(path: str | Path, value: object) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     pending = path.with_suffix(path.suffix + ".new")
@@ -49,7 +87,7 @@ def atomic_json(path, value):
     os.replace(str(pending), str(path))
 
 
-def _must_absent(kind, name):
+def _must_absent(kind: str, name: str) -> None:
     if kind == "netns":
         present = name in run(["ip", "netns", "list"]).stdout.split()
     else:
@@ -59,7 +97,7 @@ def _must_absent(kind, name):
                            (kind, name))
 
 
-def _disable_offloads(namespace, interface):
+def _disable_offloads(namespace: str, interface: str) -> None:
     result = ns_exec(
         namespace, "ethtool", "-K", interface,
         "tx", "off", "rx", "off", "tso", "off", "gso", "off", "gro", "off",
@@ -70,7 +108,9 @@ def _disable_offloads(namespace, interface):
                            (namespace, interface, result.stderr.strip()))
 
 
-def _add_ns(state, name):
+def _add_ns(state: TopologyState, name: str) -> None:
+    if "namespaces" not in state:
+        raise KeyError("namespaces")
     _must_absent("netns", name)
     run(["ip", "netns", "add", name])
     state["namespaces"].append(name)
@@ -78,7 +118,9 @@ def _add_ns(state, name):
     ns_exec(name, "ip", "link", "set", "lo", "up")
 
 
-def _add_bridge(state, asn, plane):
+def _add_bridge(state: TopologyState, asn: int, plane: str) -> None:
+    if "bridges" not in state:
+        raise KeyError("bridges")
     name = "br-l3-%d" % asn
     _must_absent("bridge", name)
     run(["ovs-vsctl", "--may-exist", "add-br", name])
@@ -89,7 +131,7 @@ def _add_bridge(state, asn, plane):
          "fail_mode=secure"])
 
 
-def temporary_peer_name(root_interface):
+def temporary_peer_name(root_interface: str) -> str:
     """Return a unique root-namespace name used before moving a veth peer."""
     name = "v-" + root_interface
     if name == "eth0" or len(name) > 15:
@@ -98,7 +140,10 @@ def temporary_peer_name(root_interface):
     return name
 
 
-def _veth_to_bridge(state, namespace, ns_if, root_if, bridge, mac=None):
+def _veth_to_bridge(state: TopologyState, namespace: str, ns_if: str,
+                    root_if: str, bridge: str, mac: str | None = None) -> None:
+    if "root_interfaces" not in state:
+        raise KeyError("root_interfaces")
     temporary = temporary_peer_name(root_if)
     run(["ip", "link", "add", root_if, "type", "veth", "peer", "name", temporary])
     state["root_interfaces"].append(root_if)
@@ -115,7 +160,10 @@ def _veth_to_bridge(state, namespace, ns_if, root_if, bridge, mac=None):
     run(["ovs-vsctl", "--may-exist", "add-port", bridge, root_if])
 
 
-def _root_veth_link(state, name, left_bridge, right_bridge):
+def _root_veth_link(state: TopologyState, name: str, left_bridge: str,
+                    right_bridge: str) -> tuple[str, str]:
+    if "root_interfaces" not in state:
+        raise KeyError("root_interfaces")
     left, right = "p%s-a" % name, "p%s-b" % name
     run(["ip", "link", "add", left, "type", "veth", "peer", "name", right])
     state["root_interfaces"].extend([left, right])
@@ -129,7 +177,7 @@ def _root_veth_link(state, name, left_bridge, right_bridge):
     return left, right
 
 
-def _ofport(interface):
+def _ofport(interface: str) -> int:
     text = run(["ovs-vsctl", "get", "Interface", interface, "ofport"]).stdout.strip()
     value = int(text)
     if value <= 0:
@@ -137,13 +185,13 @@ def _ofport(interface):
     return value
 
 
-def _configure_frr_plane(state):
+def _configure_frr_plane(state: TopologyState) -> None:
     """Isolate each LAN and peer segment while using OVS as plain L2."""
     for entry in state["ases"].values():
         bridge = entry["bridge"]
         run(["ovs-ofctl", "-O", "OpenFlow13", "del-flows", bridge])
-        host_ports = [host["ofport"] for host in entry["hosts"]]
-        lan_port = entry["speaker_ports"]["lan"]["ofport"]
+        host_ports = [port_number(host) for host in entry["hosts"]]
+        lan_port = port_number(entry["speaker_ports"]["lan"])
         for port in host_ports:
             outputs = [value for value in host_ports + [lan_port] if value != port]
             actions = ",".join("output:%d" % value for value in outputs)
@@ -156,38 +204,38 @@ def _configure_frr_plane(state):
             speaker = entry["speaker_ports"][name]
             run(["ovs-ofctl", "-O", "OpenFlow13", "add-flow", bridge,
                  "priority=100,in_port=%d,actions=output:%d" %
-                 (speaker["ofport"], external["ofport"])])
+                 (port_number(speaker), port_number(external))])
             run(["ovs-ofctl", "-O", "OpenFlow13", "add-flow", bridge,
                  "priority=100,in_port=%d,actions=output:%d" %
-                 (external["ofport"], speaker["ofport"])])
+                 (port_number(external), port_number(speaker))])
 
 
-def ovs_bootstrap_flow_specs(entry):
+def ovs_bootstrap_flow_specs(entry: ASState) -> list[str]:
     """Return control-only flows needed to establish BGP before os-ken starts."""
-    specs = []
+    specs: list[str] = []
     for name, speaker in entry["speaker_ports"].items():
         if name == "lan":
             continue
         external = entry["external_ports"][name]
         specs.append("priority=4100,in_port=%d,actions=output:%d" %
-                     (speaker["ofport"], external["ofport"]))
+                     (port_number(speaker), port_number(external)))
         for protocol in ("ip", "ipv6"):
             for direction in ("tp_src", "tp_dst"):
                 specs.append(
                     "priority=4200,in_port=%d,%s,nw_proto=6,%s=179,"
                     "actions=output:%d" %
-                    (external["ofport"], protocol, direction, speaker["ofport"]))
+                    (port_number(external), protocol, direction, port_number(speaker)))
         specs.append("priority=4200,in_port=%d,arp,actions=output:%d" %
-                     (external["ofport"], speaker["ofport"]))
+                     (port_number(external), port_number(speaker)))
         for icmp_type in (135, 136):
             specs.append(
                 "priority=4200,in_port=%d,icmp6,icmp_type=%d,"
                 "actions=output:%d" %
-                (external["ofport"], icmp_type, speaker["ofport"]))
+                (port_number(external), icmp_type, port_number(speaker)))
     return specs
 
 
-def _configure_ovs_bootstrap(state):
+def _configure_ovs_bootstrap(state: TopologyState) -> None:
     for entry in state["ases"].values():
         bridge = entry["bridge"]
         run(["ovs-ofctl", "-O", "OpenFlow13", "del-flows", bridge])
@@ -195,12 +243,12 @@ def _configure_ovs_bootstrap(state):
             run(["ovs-ofctl", "-O", "OpenFlow13", "add-flow", bridge, spec])
 
 
-def create(plane):
+def create(plane: str) -> TopologyState:
     """Create the topology and return its serializable metadata."""
     if plane not in ("frr", "ovs"):
         raise ValueError("plane must be frr or ovs")
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    state = {
+    state: TopologyState = {
         "version": 1, "plane": plane, "namespaces": [], "bridges": [],
         "root_interfaces": [], "ases": {}, "links": {}, "vxlan": VXLAN,
     }
@@ -215,7 +263,7 @@ def create(plane):
         for asn, data in sorted(AS.items()):
             router = "l3-r%d" % asn
             bridge = "br-l3-%d" % asn
-            entry = {
+            entry: ASState = {
                 "asn": data["asn"], "namespace": router, "bridge": bridge,
                 "dpid": asn, "gw4": data["gw4"], "gw6": data["gw6"],
                 "gw_mac": data["gw_mac"], "lan4": data["lan4"],
@@ -242,7 +290,7 @@ def create(plane):
                 ns_exec(host["name"], "ip", "route", "add", "default", "via", data["gw4"])
                 ns_exec(host["name"], "ip", "-6", "route", "add", "default",
                         "via", data["gw6"])
-                entry["hosts"].append(dict(host, root=root_if, namespace_if=ns_if))
+                entry["hosts"].append({**host, "root": root_if, "namespace_if": ns_if})
 
             for link in links_for(asn):
                 suffix = link["name"]
@@ -305,7 +353,7 @@ def create(plane):
         raise
 
 
-def add_vxlan():
+def add_vxlan() -> None:
     for side in ("left", "right"):
         data = VXLAN[side]
         ns = data["namespace"]
@@ -318,7 +366,7 @@ def add_vxlan():
         ns_exec(ns, "ip", "link", "set", "vxlan100", "up")
 
 
-def set_link(state, name, up):
+def set_link(state: TopologyState, name: str, up: bool) -> None:
     if name not in state["links"]:
         raise ValueError("unknown link %s" % name)
     word = "up" if up else "down"
@@ -326,7 +374,7 @@ def set_link(state, name, up):
         run(["ip", "link", "set", interface, word])
 
 
-def set_speaker_forwarding(state, enabled):
+def set_speaker_forwarding(state: TopologyState, enabled: bool) -> None:
     value = "1" if enabled else "0"
     for entry in state["ases"].values():
         ns_exec(entry["namespace"], "sysctl", "-q", "-w",
@@ -335,7 +383,7 @@ def set_speaker_forwarding(state, enabled):
                 "net.ipv6.conf.all.forwarding=" + value)
 
 
-def remove(state):
+def remove(state: TopologyResources) -> None:
     validators = (
         ("namespace", state.get("namespaces", []), r"l3-(?:r[1-4]|h(?:1a|1b|2|3|4))"),
         ("bridge", state.get("bridges", []), r"br-l3-[1-4]"),
@@ -347,7 +395,7 @@ def remove(state):
         if invalid:
             raise CommandError("refusing to remove unowned %s names: %s" %
                                (kind, ", ".join(invalid)))
-    errors = []
+    errors: list[str] = []
     for bridge in reversed(state.get("bridges", [])):
         result = run(["ovs-vsctl", "--if-exists", "del-br", bridge], check=False)
         if result.returncode:
@@ -355,7 +403,7 @@ def remove(state):
     listed_links = run(["ip", "-o", "link", "show"], check=False)
     if listed_links.returncode:
         errors.append("list-links: %s" % listed_links.stderr.strip())
-        existing_interfaces = set()
+        existing_interfaces: set[str] = set()
     else:
         existing_interfaces = {
             line.split()[1].rstrip(":").split("@", 1)[0]
@@ -376,7 +424,7 @@ def remove(state):
     listed = run(["ip", "netns", "list"], check=False)
     if listed.returncode:
         errors.append("list-netns: %s" % listed.stderr.strip())
-        existing_namespaces = set()
+        existing_namespaces: set[str] = set()
     else:
         existing_namespaces = {
             line.split()[0] for line in listed.stdout.splitlines() if line.split()

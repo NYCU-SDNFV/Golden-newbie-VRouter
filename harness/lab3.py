@@ -9,6 +9,7 @@ import json
 import logging
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -28,7 +29,7 @@ SCENARIOS = [
 ]
 
 
-def parser():
+def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="SDNFV Lab 3 networking runtime")
     sub = root.add_subparsers(dest="command", required=True)
     deploy = sub.add_parser("deploy")
@@ -44,11 +45,11 @@ def parser():
     return root
 
 
-def emit(value):
+def emit(value: object) -> None:
     print(json.dumps(value, sort_keys=True, separators=(",", ":")))
 
 
-def main(argv=None):
+def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(levelname)s %(message)s")

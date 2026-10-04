@@ -1,0 +1,14 @@
+{
+  "include": ["harness", "topo", "typings"],
+  "stubPath": "typings",
+  "pythonVersion": "3.12",
+  "pythonPlatform": "Linux",
+  "typeCheckingMode": "standard",
+  "reportUnknownParameterType": "error",
+  "reportMissingParameterType": "error",
+  "reportUnknownArgumentType": "error",
+  "reportUnknownVariableType": "error",
+  "reportUnknownMemberType": "error",
+  "reportMissingTypeStubs": "error",
+  "reportUnnecessaryTypeIgnoreComment": "error"
+}

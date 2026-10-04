@@ -5,11 +5,17 @@ This module intentionally has no dependency on editable student modules.
 import ipaddress
 import json
 import re
+from collections.abc import Sequence
+
+from harness.contracts import (
+    Flow, KernelNeighbor, KernelRoute, Neighbors, RouteKey, SelectedRoute,
+)
 
 
-def parse_kernel_routes(payload, family=None):
-    rows = json.loads(payload) if isinstance(payload, str) else payload
-    routes = []
+def parse_kernel_routes(payload: str | Sequence[KernelRoute],
+                        family: int | None = None) -> list[SelectedRoute]:
+    rows: Sequence[KernelRoute] = json.loads(payload) if isinstance(payload, str) else payload
+    routes: list[SelectedRoute] = []
     for row in rows:
         if row.get("type", "unicast") != "unicast":
             continue
@@ -39,7 +45,7 @@ def parse_kernel_routes(payload, family=None):
                 "protocol": str(row.get("protocol", "kernel")),
                 "metric": int(hop.get("metric", row.get("metric", 0)) or 0),
             })
-    selected = {}
+    selected: dict[RouteKey, SelectedRoute] = {}
     for route in routes:
         key = (route["family"], route["prefix"])
         rank = (route["metric"], route["gateway"], route["device"])
@@ -52,28 +58,31 @@ def parse_kernel_routes(payload, family=None):
         -ipaddress.ip_network(route["prefix"]).prefixlen))
 
 
-def parse_kernel_neighbors(payload):
-    rows = json.loads(payload) if isinstance(payload, str) else payload
-    usable = {}
+def parse_kernel_neighbors(payload: str | Sequence[KernelNeighbor]) -> Neighbors:
+    rows: Sequence[KernelNeighbor] = json.loads(payload) if isinstance(payload, str) else payload
+    usable: Neighbors = {}
     rejected = {"FAILED", "INCOMPLETE", "NONE"}
     for row in rows:
         raw_states = row.get("state", [])
         states = {raw_states} if isinstance(raw_states, str) else set(raw_states)
-        if (row.get("dst") and row.get("dev") and row.get("lladdr") and
+        ip, device, mac = row.get("dst"), row.get("dev"), row.get("lladdr")
+        if (ip and device and mac and
                 not states.intersection(rejected)):
-            address = str(ipaddress.ip_address(row["dst"]))
-            usable[(row["dev"], address)] = row["lladdr"].lower()
+            address = str(ipaddress.ip_address(ip))
+            usable[(device, address)] = mac.lower()
     return usable
 
 
-def parse_ovs_flows(payload):
-    flows = []
+def parse_ovs_flows(payload: str) -> list[Flow]:
+    flows: list[Flow] = []
     for line in payload.splitlines():
         if " actions=" not in line or "priority=" not in line:
             continue
         match_text, actions_text = line.split(" actions=", 1)
         cookie_match = re.search(r"\bcookie=(0x[0-9a-f]+)", match_text, re.I)
         priority_match = re.search(r"\bpriority=(\d+)", match_text)
+        if priority_match is None:
+            raise ValueError("OVS flow has no numeric priority: %s" % line)
         packets_match = re.search(r"\bn_packets=(\d+)", match_text)
         prefix_match = re.search(r"\bnw_dst=([^,\s]+)", match_text)
         family = 4
@@ -114,5 +123,5 @@ def parse_ovs_flows(payload):
     return flows
 
 
-def flow_priority(prefix):
+def flow_priority(prefix: str) -> int:
     return 1000 + ipaddress.ip_network(prefix, strict=False).prefixlen

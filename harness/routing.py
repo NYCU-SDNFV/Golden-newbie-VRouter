@@ -8,8 +8,13 @@ import ipaddress
 import json
 import socket
 import struct
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
+from harness.contracts import (
+    ForwardingPlan, InterfaceMapping, KernelNeighbor, KernelRoute, Neighbors,
+    RouteKey,
+)
 from topo.model import AS, links_for
 
 
@@ -23,11 +28,11 @@ class Route:
     metric: int = 0
 
     @property
-    def prefixlen(self):
+    def prefixlen(self) -> int:
         return ipaddress.ip_network(self.prefix, strict=False).prefixlen
 
 
-def bgp_stanza(as_number, include_dormant=False):
+def bgp_stanza(as_number: int, include_dormant: bool = False) -> str:
     """Build dual-stack FRR BGP policy for one AS.
 
     AS1 deliberately prefers routes learned through AS2 (local-pref 200), so
@@ -36,7 +41,7 @@ def bgp_stanza(as_number, include_dormant=False):
     raise NotImplementedError("TODO BGP: configure IPv4/IPv6 eBGP, announcements, timers, and AS1 policy")
 
 
-def build_frr_config(as_number):
+def build_frr_config(as_number: int) -> str:
     """Return one integrated zebra/bgpd configuration."""
     data = AS[as_number]
     return "\n".join([
@@ -54,7 +59,7 @@ def build_frr_config(as_number):
     ])
 
 
-def parse_fib(payload, family=None):
+def parse_fib(payload: str | Sequence[KernelRoute], family: int | None = None) -> list[Route]:
     """Parse `ip -j route` output into selected unicast Route objects.
 
     Multipath entries are expanded.  Unreachable/blackhole routes and routes
@@ -66,10 +71,10 @@ def parse_fib(payload, family=None):
 class RouteTable:
     """Controller route state keyed by address family and canonical prefix."""
 
-    def __init__(self):
-        self._routes = {}
+    def __init__(self) -> None:
+        self._routes: dict[RouteKey, Route] = {}
 
-    def replace(self, routes):
+    def replace(self, routes: Iterable[Route]) -> tuple[list[Route], list[Route]]:
         """Replace best routes and return (added_or_changed, withdrawn).
 
         Lower metric wins for duplicate prefixes.  A deterministic gateway and
@@ -77,10 +82,11 @@ class RouteTable:
         """
         raise NotImplementedError("TODO FIB state: replace changed routes and explicitly withdraw missing prefixes")
 
-    def values(self):
+    def values(self) -> list[Route]:
         return list(self._routes.values())
 
-    def lookup(self, address):
+    def lookup(self, address: str | int | bytes | ipaddress.IPv4Address |
+               ipaddress.IPv6Address) -> Route | None:
         ip = ipaddress.ip_address(address)
         candidates = [
             route for route in self._routes.values()
@@ -90,49 +96,54 @@ class RouteTable:
         return max(candidates, key=lambda route: route.prefixlen) if candidates else None
 
 
-def flow_priority(prefix, base=1000):
+def flow_priority(prefix: str, base: int = 1000) -> int:
     """OpenFlow priority preserving IP longest-prefix matching."""
     network = ipaddress.ip_network(prefix, strict=False)
     return base + network.prefixlen
 
 
-def forwarding_actions(route, source_mac, destination_mac, output_port):
+def forwarding_actions(route: Route, source_mac: str, destination_mac: str,
+                       output_port: int | str) -> ForwardingPlan:
     """Return an explicit, serializer-neutral routed forwarding plan."""
     raise NotImplementedError("TODO forwarding: decrement the L3 lifetime once, rewrite both Ethernet addresses, and output")
 
 
-def parse_neighbors(payload):
+def parse_neighbors(payload: str | Sequence[KernelNeighbor]) -> Neighbors:
     """Map (device, IP) to reachable link-layer address from `ip -j neigh`."""
     raise NotImplementedError("TODO neighbors: accept only usable actual ARP/ND cache entries")
 
 
-def resolve_next_hop(route, neighbors, interface_map):
+def resolve_next_hop(route: Route, neighbors: Mapping[tuple[str, str], str],
+                     interface_map: Mapping[str, InterfaceMapping]) -> tuple[str, int]:
     """Resolve a FIB route to (destination MAC, OpenFlow output port)."""
     raise NotImplementedError("TODO gateway: combine the selected FIB next hop, actual neighbor state, and OVS port")
 
 
-def internet_checksum(data):
+def internet_checksum(data: bytes) -> int:
     if len(data) % 2:
         data += b"\x00"
-    total = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    words: tuple[int, ...] = struct.unpack("!%dH" % (len(data) // 2), data)
+    total = sum(words)
     total = (total & 0xffff) + (total >> 16)
     total = (total & 0xffff) + (total >> 16)
     return (~total) & 0xffff
 
 
-def mac_bytes(value):
+def mac_bytes(value: str) -> bytes:
     raw = bytes(int(part, 16) for part in value.split(":"))
     if len(raw) != 6:
         raise ValueError("invalid MAC")
     return raw
 
 
-def build_arp_reply(frame, gateway_ip, gateway_mac):
+def build_arp_reply(frame: bytes, gateway_ip: str, gateway_mac: str) -> bytes | None:
     """Build a validated Ethernet/IPv4 ARP gateway reply, or return None."""
     if len(frame) < 42:
         return None
+    ethertype: int
     dst, src, ethertype = frame[:6], frame[6:12], struct.unpack("!H", frame[12:14])[0]
-    fields = struct.unpack("!HHBBH6s4s6s4s", frame[14:42])
+    fields: tuple[int, int, int, int, int, bytes, bytes, bytes, bytes] = struct.unpack(
+        "!HHBBH6s4s6s4s", frame[14:42])
     htype, proto, hlen, plen, operation, sha, spa, tha, tpa = fields
     target = socket.inet_aton(gateway_ip)
     if (ethertype != 0x0806 or htype != 1 or proto != 0x0800 or
@@ -145,14 +156,15 @@ def build_arp_reply(frame, gateway_ip, gateway_mac):
     return sha + gateway + struct.pack("!H", 0x0806) + arp
 
 
-def _icmpv6_checksum(source, destination, payload):
+def _icmpv6_checksum(source: str, destination: str, payload: bytes) -> int:
     pseudo = (socket.inet_pton(socket.AF_INET6, source) +
               socket.inet_pton(socket.AF_INET6, destination) +
               struct.pack("!I3xB", len(payload), 58))
     return internet_checksum(pseudo + payload)
 
 
-def build_nd_advertisement(frame, gateway_ip, gateway_mac):
+def build_nd_advertisement(frame: bytes, gateway_ip: str,
+                           gateway_mac: str) -> bytes | None:
     """Build a standards-checked ICMPv6 neighbor advertisement.
 
     This scoped implementation handles a directly attached, extension-header
@@ -164,7 +176,8 @@ def build_nd_advertisement(frame, gateway_ip, gateway_mac):
     dst_mac, src_mac = frame[:6], frame[6:12]
     if struct.unpack("!H", frame[12:14])[0] != 0x86dd:
         return None
-    version, payload_len, next_header, hop_limit = struct.unpack("!IHBB", frame[14:22])
+    fields: tuple[int, int, int, int] = struct.unpack("!IHBB", frame[14:22])
+    version, payload_len, next_header, hop_limit = fields
     if version >> 28 != 6 or next_header != 58 or hop_limit != 255:
         return None
     source_raw, destination_raw = frame[22:38], frame[38:54]
@@ -200,7 +213,8 @@ def build_nd_advertisement(frame, gateway_ip, gateway_mac):
     return reply_mac + gateway + struct.pack("!H", 0x86dd) + header + body
 
 
-def build_icmpv4_time_exceeded(frame, router_ip, router_mac):
+def build_icmpv4_time_exceeded(frame: bytes, router_ip: str,
+                              router_mac: str) -> bytes | None:
     """Return an RFC 792 Time Exceeded frame for a plain IPv4 packet."""
     if len(frame) < 34 or struct.unpack("!H", frame[12:14])[0] != 0x0800:
         return None
@@ -221,7 +235,8 @@ def build_icmpv4_time_exceeded(frame, router_ip, router_mac):
     return frame[6:12] + gateway + struct.pack("!H", 0x0800) + outer + icmp
 
 
-def build_icmpv6_time_exceeded(frame, router_ip, router_mac):
+def build_icmpv6_time_exceeded(frame: bytes, router_ip: str,
+                              router_mac: str) -> bytes | None:
     """Return an RFC 4443 Time Exceeded frame for a plain IPv6 packet."""
     if len(frame) < 54 or struct.unpack("!H", frame[12:14])[0] != 0x86dd:
         return None

@@ -6,10 +6,23 @@ import signal
 import subprocess
 import time
 import ipaddress
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Literal, TypeVar, cast, overload
 
 from harness import oracle, runtime
+from harness.contracts import (
+    Absent, CaptureResult, CheckResult, ControllerState, DeployedStatus,
+    DuplicateFlow, ExpectedFlow, FieldDifference, Flow, FlowComparison,
+    ForwardingConvergence, KernelLink, KernelRoute, LessSpecificFlow,
+    LifetimeProbe, Measurements, PingResult, PrefixObservation, PrefixRecord,
+    RouteKey, RouteLookup, RuntimeState, SelectedRoute, StaleFlow,
+    UnresolvedRoute, WrongFlow,
+)
 from topo import lab3_topo
+from topo.model import Port, SpeakerPort, TopologyState, port_number
+
+T = TypeVar("T")
 
 
 class CheckFailure(RuntimeError):
@@ -24,7 +37,8 @@ CUSTOMER_BPF = (
 )
 
 
-def _run(argv, timeout=12, check=False):
+def _run(argv: Sequence[str], timeout: float = 12,
+         check: bool = False) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["LC_ALL"] = "C"
     try:
@@ -39,27 +53,30 @@ def _run(argv, timeout=12, check=False):
     return proc
 
 
-def _ns(namespace, *argv, **kwargs):
-    return _run(["ip", "netns", "exec", namespace] + list(argv), **kwargs)
+def _ns(namespace: str, *argv: str, timeout: float = 12,
+        check: bool = False) -> subprocess.CompletedProcess[str]:
+    return _run(["ip", "netns", "exec", namespace] + list(argv),
+                timeout=timeout, check=check)
 
 
-def _state():
+def _state() -> tuple[DeployedStatus, TopologyState]:
     status = runtime.status()
-    if not status.get("deployed"):
+    if status["deployed"] is False:
         raise CheckFailure("Lab 3 is not deployed")
     if not status.get("healthy"):
         raise CheckFailure("Lab 3 runtime has an unhealthy owned process")
-    return status, runtime.load_json(runtime.TOPOLOGY_FILE)
+    return status, cast(TopologyState, runtime.load_json(runtime.TOPOLOGY_FILE))
 
 
-def _loss(output):
+def _loss(output: str) -> float:
     match = re.search(r"(\d+(?:\.\d+)?)% packet loss", output)
     if not match:
         raise CheckFailure("ping did not report packet loss: %s" % output[-300:])
     return float(match.group(1))
 
 
-def _ping(namespace, destination, family=4, count=3, size=None, mtu=False):
+def _ping(namespace: str, destination: str, family: int = 4, count: int = 3,
+          size: int | None = None, mtu: bool = False) -> PingResult:
     argv = ["ping", "-n", "-c", str(count), "-W", "1"]
     if family == 6:
         argv.append("-6")
@@ -74,7 +91,8 @@ def _ping(namespace, destination, family=4, count=3, size=None, mtu=False):
             "output": text[-500:]}
 
 
-def _wait_ping(namespace, destination, family, timeout=8):
+def _wait_ping(namespace: str, destination: str, family: int,
+               timeout: float = 8) -> PingResult:
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
@@ -85,11 +103,11 @@ def _wait_ping(namespace, destination, family, timeout=8):
     raise CheckFailure("forwarding did not converge to %s: %r" % (destination, last))
 
 
-def _route(asn, destination, family):
+def _route(asn: int, destination: str, family: int) -> RouteLookup:
     flag = "-6" if family == 6 else "-4"
     proc = _ns("l3-r%d" % asn, "ip", "-j", flag, "route", "get", destination,
                check=True)
-    rows = json.loads(proc.stdout)
+    rows: list[KernelRoute] = json.loads(proc.stdout)
     if not rows:
         raise CheckFailure("AS%d has no route to %s" % (asn, destination))
     row = rows[0]
@@ -97,9 +115,9 @@ def _route(asn, destination, family):
             "device": row.get("dev", ""), "source": row.get("prefsrc", "")}
 
 
-def _bgp(family):
-    observations = {}
-    prefixes = {}
+def _bgp(family: int) -> CheckResult:
+    observations: dict[str, int] = {}
+    prefixes: dict[str, PrefixObservation] = {}
     expected = {
         4: {
             1: {"10.2.0.0/24", "10.3.0.0/24"},
@@ -131,20 +149,20 @@ def _bgp(family):
                     "family": family}
 
 
-def _require_plane(status, plane):
+def _require_plane(status: DeployedStatus, plane: str) -> None:
     if status["plane"] != plane:
         raise CheckFailure("check requires --plane %s (deployed plane is %s)" %
                            (plane, status["plane"]))
 
 
-def _dump_flows(bridge):
+def _dump_flows(bridge: str) -> list[Flow]:
     proc = _run(["ovs-ofctl", "-O", "OpenFlow13", "dump-flows", bridge],
                 check=True)
     return oracle.parse_ovs_flows(proc.stdout)
 
 
-def _kernel_bgp_routes(asn):
-    routes = []
+def _kernel_bgp_routes(asn: int) -> list[SelectedRoute]:
+    routes: list[SelectedRoute] = []
     for family, flag in ((4, "-4"), (6, "-6")):
         proc = _ns("l3-r%d" % asn, "ip", "-j", flag, "route", "show",
                    "proto", "bgp", check=True)
@@ -152,23 +170,23 @@ def _kernel_bgp_routes(asn):
     return routes
 
 
-def _expected_route_flows(asn, topology):
+def _expected_route_flows(asn: int, topology: TopologyState) -> tuple[dict[RouteKey, ExpectedFlow], list[UnresolvedRoute]]:
     entry = topology["ases"][str(asn)]
     neighbors = oracle.parse_kernel_neighbors(
         _ns(entry["namespace"], "ip", "-j", "neigh", "show", check=True).stdout)
-    interfaces = {}
+    interfaces: dict[str, tuple[SpeakerPort, Port]] = {}
     for name, speaker in entry["speaker_ports"].items():
         if name != "lan":
             interfaces[speaker["namespace_if"]] = (
                 speaker, entry["external_ports"][name])
-    expected = {}
-    unresolved = []
+    expected: dict[RouteKey, ExpectedFlow] = {}
+    unresolved: list[UnresolvedRoute] = []
     for route in _kernel_bgp_routes(asn):
         mapping = interfaces.get(route["device"])
         key = (route["family"], route["prefix"])
         neighbor_key = ((route["device"], str(ipaddress.ip_address(route["gateway"])))
                         if route["gateway"] else None)
-        if mapping is None or neighbor_key not in neighbors:
+        if mapping is None or neighbor_key is None or neighbor_key not in neighbors:
             unresolved.append({
                 "family": route["family"], "prefix": route["prefix"],
                 "device": route["device"], "gateway": route["gateway"],
@@ -180,13 +198,13 @@ def _expected_route_flows(asn, topology):
             "priority": oracle.flow_priority(route["prefix"]),
             "eth_src": speaker["mac"].lower(),
             "eth_dst": neighbors[neighbor_key],
-            "output": external["ofport"], "dec_ttl": True,
+            "output": port_number(external), "dec_ttl": True,
             "gateway": route["gateway"], "device": route["device"],
         }
     return expected, unresolved
 
 
-def _compare_real_flows(asn, topology):
+def _compare_real_flows(asn: int, topology: TopologyState) -> FlowComparison:
     expected, unresolved = _expected_route_flows(asn, topology)
     entry = topology["ases"][str(asn)]
     all_flows = _dump_flows(entry["bridge"])
@@ -195,7 +213,7 @@ def _compare_real_flows(asn, topology):
         if flow["route_cookie"] and flow["priority"] < 2000 and flow["prefix"]
     ]
     actual = {(flow["family"], flow["prefix"]): flow for flow in actual_list}
-    duplicate = []
+    duplicate: list[DuplicateFlow] = []
     for key in set((flow["family"], flow["prefix"]) for flow in actual_list):
         matches = [flow for flow in actual_list
                    if (flow["family"], flow["prefix"]) == key]
@@ -211,9 +229,9 @@ def _compare_real_flows(asn, topology):
         flow for flow in all_flows
         if flow["route_cookie"] and flow["priority"] < 2000 and not flow["prefix"]
     ]
-    missing = []
-    wrong = []
-    less_specific = []
+    missing: list[PrefixRecord] = []
+    wrong: list[WrongFlow] = []
+    less_specific: list[LessSpecificFlow] = []
     for key, wanted in expected.items():
         observed = actual.get(key)
         if observed is None:
@@ -222,21 +240,29 @@ def _compare_real_flows(asn, topology):
             for flow in actual_list:
                 if flow["family"] == key[0]:
                     candidate = ipaddress.ip_network(flow["prefix"])
-                    if network.subnet_of(candidate) and candidate != network:
+                    if isinstance(network, ipaddress.IPv4Network):
+                        if not isinstance(candidate, ipaddress.IPv4Network):
+                            raise TypeError("route and flow use different IP versions")
+                        subnet = network.subnet_of(candidate)
+                    else:
+                        if not isinstance(candidate, ipaddress.IPv6Network):
+                            raise TypeError("route and flow use different IP versions")
+                        subnet = network.subnet_of(candidate)
+                    if subnet and candidate != network:
                         less_specific.append({
                             "expected": key[1], "actual": flow["prefix"],
                             "actual_priority": flow["priority"],
                         })
             continue
         fields = ("priority", "eth_src", "eth_dst", "output", "dec_ttl")
-        differences = {
+        differences: dict[str, FieldDifference] = {
             field: {"expected": wanted[field], "actual": observed[field]}
             for field in fields if observed[field] != wanted[field]
         }
         if differences:
             wrong.append({"family": key[0], "prefix": key[1],
                           "differences": differences, "raw": observed["raw"]})
-    stale = [
+    stale: list[StaleFlow] = [
         {"family": key[0], "prefix": key[1], "raw": flow["raw"]}
         for key, flow in actual.items() if key not in expected
     ]
@@ -252,7 +278,7 @@ def _compare_real_flows(asn, topology):
     }
 
 
-def _controller_connected(bridge):
+def _controller_connected(bridge: str) -> bool:
     raw = _run(["ovs-vsctl", "get", "Bridge", bridge, "controller"],
                check=True).stdout.strip()
     identifiers = re.findall(r"[0-9a-f]{8}-[0-9a-f-]{27,}", raw, re.I)
@@ -264,7 +290,7 @@ def _controller_connected(bridge):
         for identifier in identifiers)
 
 
-def _route_flow(bridge, family, prefix):
+def _route_flow(bridge: str, family: int, prefix: str) -> Flow:
     matches = [
         flow for flow in _dump_flows(bridge)
         if flow["route_cookie"] and flow["family"] == family and
@@ -276,7 +302,7 @@ def _route_flow(bridge, family, prefix):
     return matches[0]
 
 
-def _capture_counts(text):
+def _capture_counts(text: str) -> dict[int, int]:
     lines = [line for line in text.splitlines() if line.strip()]
     return {
         4: sum(1 for line in lines if re.search(r"\bIP\b", line)),
@@ -284,7 +310,9 @@ def _capture_counts(text):
     }
 
 
-def _wait_capture_records(capture, families, process, timeout=2):
+def _wait_capture_records(capture: Path, families: Sequence[int],
+                          process: subprocess.Popen[bytes],
+                          timeout: float = 2) -> dict[int, int]:
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
@@ -300,7 +328,8 @@ def _wait_capture_records(capture, families, process, timeout=2):
                        ("/".join(str(family) for family in families), detail))
 
 
-def _capture_customer(interface, label, probe, families=(4, 6)):
+def _capture_customer(interface: str, label: str, probe: Callable[[], T],
+                       families: Sequence[int] = (4, 6)) -> tuple[T, CaptureResult]:
     capture = runtime.CAPTURES / ("%s-%d.pcap" % (label, time.time_ns()))
     log_path = runtime.RESULTS / (label + "-tcpdump.log")
     log = log_path.open("ab", buffering=0)
@@ -338,7 +367,7 @@ def _capture_customer(interface, label, probe, families=(4, 6)):
     }
 
 
-def _ping_case(source, destination, family, kind):
+def _ping_case(source: str, destination: str, family: int, kind: str) -> CheckResult:
     status, _ = _state()
     result = _ping(source, destination, family)
     route = None
@@ -350,11 +379,11 @@ def _ping_case(source, destination, family, kind):
     }
 
 
-def _fib_sync():
+def _fib_sync() -> CheckResult:
     status, topology = _state()
     _require_plane(status, "ovs")
-    controller = runtime.load_json(runtime.STATE_DIR / "controller.json")
-    comparisons = {}
+    controller = cast(ControllerState, runtime.load_json(runtime.STATE_DIR / "controller.json"))
+    comparisons: dict[str, FlowComparison] = {}
     age = time.time() - float(controller.get("updated", 0))
     passed = not controller.get("last_error") and 0 <= age <= 3
     for asn in (1, 2, 3):
@@ -365,11 +394,11 @@ def _fib_sync():
                     "controller_state_age_seconds": age}
 
 
-def _ttl(family):
+def _ttl(family: int) -> CheckResult:
     status, _ = _state()
     _require_plane(status, "ovs")
     destination = "10.3.0.10" if family == 4 else "2001:db8:3::10"
-    probes = []
+    probes: list[LifetimeProbe] = []
     pattern = "Time to live exceeded" if family == 4 else "Time exceeded"
     for lifetime in (1, 2, 3):
         argv = ["ping", "-n", "-c", "1", "-W", "2"]
@@ -394,7 +423,7 @@ def _ttl(family):
     }
 
 
-def _vxlan():
+def _vxlan() -> CheckResult:
     _, topology = _state()
     capture = runtime.CAPTURES / ("vxlan-%d.pcap" % int(time.time()))
     interface = topology["links"]["12"]["interfaces"][0]
@@ -443,7 +472,27 @@ def _vxlan():
     }
 
 
-def _wait_route(asn, destination, family, expected_device=None, absent=False, timeout=18):
+@overload
+def _wait_route(asn: int, destination: str, family: int,
+                 expected_device: str | None = None, absent: Literal[False] = False,
+                 timeout: float = 18) -> RouteLookup: ...
+
+
+@overload
+def _wait_route(asn: int, destination: str, family: int,
+                 expected_device: str | None = None, *, absent: Literal[True],
+                 timeout: float = 18) -> Absent: ...
+
+
+@overload
+def _wait_route(asn: int, destination: str, family: int,
+                 expected_device: str | None = None, absent: bool = False,
+                 timeout: float = 18) -> RouteLookup | Absent: ...
+
+
+def _wait_route(asn: int, destination: str, family: int,
+                 expected_device: str | None = None, absent: bool = False,
+                 timeout: float = 18) -> RouteLookup | Absent:
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
@@ -461,7 +510,23 @@ def _wait_route(asn, destination, family, expected_device=None, absent=False, ti
     raise CheckFailure("route did not converge via %s: %r" % (expected_device, last))
 
 
-def _wait_route_flow(bridge, family, prefix, present, timeout=8):
+@overload
+def _wait_route_flow(bridge: str, family: int, prefix: str,
+                      present: Literal[True], timeout: float = 8) -> Flow: ...
+
+
+@overload
+def _wait_route_flow(bridge: str, family: int, prefix: str,
+                      present: Literal[False], timeout: float = 8) -> Absent: ...
+
+
+@overload
+def _wait_route_flow(bridge: str, family: int, prefix: str,
+                      present: bool, timeout: float = 8) -> Flow | Absent: ...
+
+
+def _wait_route_flow(bridge: str, family: int, prefix: str,
+                      present: bool, timeout: float = 8) -> Flow | Absent:
     deadline = time.monotonic() + timeout
     last = []
     while time.monotonic() < deadline:
@@ -477,15 +542,16 @@ def _wait_route_flow(bridge, family, prefix, present, timeout=8):
                        (prefix, present, last))
 
 
-def _dual_probe(destination_as):
+def _dual_probe(destination_as: int) -> dict[str, PingResult]:
     return {
         "ipv4": _ping("l3-h1a", "10.%d.0.10" % destination_as, 4),
         "ipv6": _ping("l3-h1a", "2001:db8:%d::10" % destination_as, 6),
     }
 
 
-def _wait_forwarding_convergence(topology, destination_as=3):
-    def ready():
+def _wait_forwarding_convergence(topology: TopologyState,
+                                 destination_as: int = 3) -> ForwardingConvergence:
+    def ready() -> dict[str, FlowComparison] | Literal[False]:
         observations = {
             str(asn): _compare_real_flows(asn, topology) for asn in (1, 2, 3)
         }
@@ -500,10 +566,10 @@ def _wait_forwarding_convergence(topology, destination_as=3):
     return {"flows": flows, "first_reachable": probes}
 
 
-def _withdrawal():
+def _withdrawal() -> CheckResult:
     status, topology = _state()
     _require_plane(status, "ovs")
-    before = {
+    before: Measurements = {
         "ipv4_route": _route(1, "10.3.0.10", 4),
         "ipv6_route": _route(1, "2001:db8:3::10", 6),
         "ipv4_flow": _route_flow("br-l3-1", 4, "10.3.0.0/24"),
@@ -528,9 +594,9 @@ def _withdrawal():
         elapsed = time.monotonic() - started
         probe = _dual_probe(3)
         links_reachable = {
-            interface: json.loads(_run(
+            interface: cast(list[KernelLink], json.loads(_run(
                 ["ip", "-j", "link", "show", "dev", interface],
-                check=True).stdout)[0]["operstate"]
+                check=True).stdout))[0]["operstate"]
             for link in ("13", "23")
             for interface in topology["links"][link]["interfaces"]
         }
@@ -550,7 +616,7 @@ def _withdrawal():
             "exit-address-family", "address-family ipv6 unicast",
             "network 2001:db8:3::/64", "end",
         ])
-        restored = {
+        restored: Measurements = {
             "ipv4_route": _wait_route(1, "10.3.0.10", 4, "r1-12"),
             "ipv6_route": _wait_route(1, "2001:db8:3::10", 6, "r1-12"),
             "ipv4_flow": _wait_route_flow(
@@ -571,7 +637,7 @@ def _withdrawal():
     }
 
 
-def _failover():
+def _failover() -> CheckResult:
     status, topology = _state()
     before = {
         "ipv4": _route(1, "10.3.0.10", 4),
@@ -616,7 +682,7 @@ def _failover():
                     "plane": status["plane"]}
 
 
-def _policy():
+def _policy() -> CheckResult:
     _, topology = _state()
     before = {
         "ipv4": _route(1, "10.3.0.10", 4),
@@ -652,7 +718,7 @@ def _policy():
                     "restore_probe": restore_probe}
 
 
-def _new_as():
+def _new_as() -> CheckResult:
     status, topology = _state()
     try:
         runtime._scenario_unlocked("add-as")
@@ -696,11 +762,14 @@ def _new_as():
                     "removed_flows": removed_flows}
 
 
-def _control_down():
+def _control_down() -> CheckResult:
     status, topology = _state()
     _require_plane(status, "ovs")
-    state = runtime.load_json(runtime.RUNTIME_FILE)
-    pid = state["controller"]["pid"]
+    state = cast(RuntimeState, runtime.load_json(runtime.RUNTIME_FILE))
+    controller = state["controller"]
+    if controller is None:
+        raise CheckFailure("OVS runtime has no recorded controller process")
+    pid = controller["pid"]
     if not runtime._require_owned(pid, ["osken-manager", "controller.py"]):
         raise CheckFailure("refusing to signal non-owned controller PID %d" % pid)
     warmups = {
@@ -717,7 +786,7 @@ def _control_down():
     }
     if not all(configured_before.values()):
         raise CheckFailure("the test must retain a configured controller on every bridge")
-    forwards = {}
+    forwards: dict[str, PingResult] = {}
     before_flows = {
         "ipv4": _route_flow("br-l3-2", 4, "10.3.0.0/24"),
         "ipv6": _route_flow("br-l3-2", 6, "2001:db8:3::/64"),
@@ -778,7 +847,7 @@ def _control_down():
     decoded = _run(["tcpdump", "-nn", "-r", str(capture)], check=False)
     captured_data = [line for line in decoded.stdout.splitlines() if line.strip()]
     forwarding = all(item["loss_percent"] == 0 for item in forwards.values())
-    sysctls = {}
+    sysctls: dict[str, dict[str, int]] = {}
     for asn in (1, 2, 3):
         v4 = _ns("l3-r%d" % asn, "sysctl", "-n", "net.ipv4.ip_forward",
                  check=True).stdout.strip()
@@ -811,7 +880,7 @@ def _control_down():
     }
 
 
-def _transit(family):
+def _transit(family: int) -> CheckResult:
     status, topology = _state()
     destination = "10.3.0.10" if family == 4 else "2001:db8:3::10"
     prefix = "10.3.0.0/24" if family == 4 else "2001:db8:3::/64"
@@ -819,7 +888,7 @@ def _transit(family):
     if status["plane"] == "ovs":
         before = _route_flow("br-l3-2", family, prefix)
 
-    def probe():
+    def probe() -> PingResult:
         return _ping("l3-h1a", destination, family)
 
     ping, capture = _capture_customer(
@@ -827,12 +896,12 @@ def _transit(family):
         "transit%d" % family, probe, families=(family,))
     family_packets = capture["ipv4_packets"] if family == 4 else capture["ipv6_packets"]
     passed = ping["loss_percent"] == 0 and family_packets > 0
-    measurements = {
+    measurements: Measurements = {
         "probe": ping, "route": _route(1, destination, family),
         "plane": status["plane"], "kind": "transit",
         "as2_customer_capture": capture,
     }
-    if status["plane"] == "ovs":
+    if before is not None:
         after = _route_flow("br-l3-2", family, prefix)
         measurements["route_flow_before"] = before
         measurements["route_flow_after"] = after
@@ -841,9 +910,9 @@ def _transit(family):
     return passed, measurements
 
 
-def run_case(case):
+def run_case(case: str) -> CheckResult:
     status, _ = _state()
-    dispatch = {
+    dispatch: dict[str, Callable[[], CheckResult]] = {
         "bgp4": lambda: _bgp(4),
         "bgp6": lambda: _bgp(6),
         "frr4": lambda: (_require_plane(status, "frr") or
