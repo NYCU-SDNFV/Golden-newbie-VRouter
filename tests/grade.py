@@ -153,27 +153,63 @@ def section_body(text, heading):
     return re.split(r"(?m)^## ", following, maxsplit=1)[0].strip()
 
 
-def grade_report(root):
-    text = (root / "REPORT.md").read_text(encoding="utf-8")
-    if "<!-- BEGIN" + " KEY -->" in text:
-        raise ValueError("materialize the private key before validating its report")
+MINIMUM_OWN_TEXT = 80
+
+
+def own_text(text):
+    """Text the student wrote: HTML comments, headings and the template's own
+    instruction lines (lines starting with 'TODO:') are not counted. Words such
+    as 'todo' or 'placeholder' inside your own sentences are fine."""
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+    kept = [line.strip() for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith(("#", "TODO:"))]
+    return "\n".join(kept)
+
+
+def check_evidence(root, text):
     if text.count(EVIDENCE_START) != 1 or text.count(EVIDENCE_END) != 1:
-        raise ValueError("REPORT.md must retain one evidence block")
+        raise ValueError(f"REPORT.md must keep exactly one {EVIDENCE_START} ... {EVIDENCE_END} block")
     block = text.split(EVIDENCE_START, 1)[1].split(EVIDENCE_END, 1)[0].strip()
     fenced = re.fullmatch(r"```json\s*\n(.*?)\n```", block, re.S)
     if fenced:
         block = fenced.group(1)
-    observed = json.loads(block)
+    try:
+        observed = json.loads(block)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"the evidence block is not valid JSON ({exc}); paste the output of "
+                         "`python3 tests/grade.py evidence`") from exc
     expected = evidence_summary(root)
     if observed != expected:
-        raise ValueError("report evidence claims do not match the current measured results; inspect the actual probes")
+        raise ValueError("report evidence claims do not match the current measured results; "
+                         "paste the output of `python3 tests/grade.py evidence` after your latest runs")
+
+
+def grade_report(root):
+    text = (root / "REPORT.md").read_text(encoding="utf-8")
+    if "<!-- BEGIN" + " KEY -->" in text:
+        raise ValueError("materialize the private key before validating its report")
+    problems = []
+    try:
+        check_evidence(root, text)
+    except ValueError as exc:
+        problems.append(str(exc))
     for heading in REPORT_SECTIONS:
-        body = section_body(text, heading)
-        if len(body) < 80 or re.search(r"\b(?:TODO|TBD|PLACEHOLDER)\b", body, re.I):
-            raise ValueError(f"REPORT.md: finish '{heading}' using your own observations (at least 80 characters)")
-    disclosure = (root / "ai-usage.md").read_text(encoding="utf-8")
-    if len(disclosure.strip()) < 80 or re.search(r"\b(?:TODO|TBD|PLACEHOLDER)\b", disclosure, re.I):
-        raise ValueError("finish ai-usage.md; using no AI is valid, but explain what you verified")
+        try:
+            body = own_text(section_body(text, heading))
+        except ValueError as exc:
+            problems.append(f"{exc}; keep all seven headings")
+            continue
+        if len(body) < MINIMUM_OWN_TEXT:
+            problems.append(f"'## {heading}' has {len(body)} characters of your own text; "
+                            f"write at least {MINIMUM_OWN_TEXT} (the template's 'TODO:' line does not count)")
+    disclosure = own_text((root / "ai-usage.md").read_text(encoding="utf-8"))
+    if len(disclosure) < MINIMUM_OWN_TEXT:
+        problems.append(f"ai-usage.md has {len(disclosure)} characters of your own text; write at least "
+                        f"{MINIMUM_OWN_TEXT} (the template's 'TODO:' line does not count). Using no AI is "
+                        "valid: say so and describe how you verified your work")
+    if problems:
+        raise ValueError("the report check found " + str(len(problems)) + " problem(s):\n  - "
+                         + "\n  - ".join(problems))
     print("PASS: report evidence matches the actual runs; explanations and AI disclosure are present")
     print("INFO: the TA assesses correctness of the explanations, not this length check")
     return True
@@ -190,7 +226,10 @@ def main():
             return 0
         passed = grade_report(root) if arguments.group == "report" else run_group(arguments.group, root)
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
-        print(f"FAIL: Lab 3 check could not complete: {exc}", file=sys.stderr)
+        if arguments.group == "report" and isinstance(exc, ValueError):
+            print(f"FAIL: {exc}", file=sys.stderr)
+        else:
+            print(f"FAIL: Lab 3 check could not complete: {exc}", file=sys.stderr)
         return 1
     return 0 if passed else 1
 

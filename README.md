@@ -144,6 +144,21 @@ checked against fresh experiment results. Absolute latency/throughput values are
 not used as machine-specific pass thresholds. The TA assesses whether your
 explanations and interpretation of the data are correct.
 
+What `make report` (check R, 5 points) looks at -- these rules are the whole check:
+
+- `REPORT.md` keeps all seven `##` section headings, and each section has at least
+  80 characters of your own text. Lines starting with `TODO:` are the template's
+  instructions and are not counted (delete them when you are done); headings and
+  HTML comments are not counted either. Ordinary words such as "todo" or
+  "placeholder" inside your sentences are fine.
+- `REPORT.md` keeps exactly one `<!-- BEGIN EVIDENCE -->` ... `<!-- END EVIDENCE -->`
+  block, and its JSON equals the output of `python3 tests/grade.py evidence` for your
+  latest successful runs. Only this block is parsed; your own tables and text
+  elsewhere cannot break the check.
+- `ai-usage.md` has at least 80 characters of your own text (same counting rule).
+  Using no AI is valid: say so and describe how you verified your work.
+- A failed check lists every problem it found at once.
+
 The configured VXLAN example has an **IPv4 outer header**: a 1500-byte underlay
 leaves 1450 bytes for the overlay IP MTU. Do not generalize the 50-byte overhead
 to an IPv6 outer header, extra VLAN tags or additional tunnels.

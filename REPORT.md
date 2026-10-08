@@ -4,6 +4,11 @@ Keep the headings. Record the actual next hops, packet observations, and timing
 from your runs; do not copy another machine's numbers. The TA checks the content
 of these explanations during the supervised assessment.
 
+Autograder (check R): each of the seven sections below needs at least 80 characters
+of your own text; lines starting with `TODO:` are instructions and do not count, so
+you may delete them. Only the JSON between the EVIDENCE markers at the end is parsed;
+your tables and prose elsewhere are not.
+
 ## Topology and addressing
 
 TODO: Draw your topology and list customer prefixes, peer addresses, AS numbers, and default/alternate paths.
